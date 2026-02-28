@@ -1,0 +1,23 @@
+# Virtual Environments
+.venv/
+.venv311/
+env/
+venv/
+
+# Environment Variables
+.env
+
+# PyCharm / IDEs
+.idea/
+.vscode/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Project Specific
+jarvis_memory.db
+model/
+
+# macOS
+.DS_Store
