@@ -47,8 +47,25 @@ Here is exactly what Jarvis can do for you:
 
 ## 🏗️ Project Architecture & Tech Stack
 
-The project is neatly organized into `src/`, `docs/`, and `data/` directories to keep the codebase clean. 
+### 📂 Folder Structure
+The project is neatly organized to separate the source code, databases, and documentation:
 
+```text
+jarvis-AI/
+├── src/
+│   └── main.py              # The core application code (GUI, Voice Logic, System Actions)
+├── data/
+│   └── jarvis_memory.db     # SQLite database storing your conversation history
+├── docs/
+│   ├── PRD.md               # Product Requirements Document
+│   ├── TRD.md               # Technical Requirements Document
+│   └── JARVIS_COMMANDS.md   # Full cheat sheet of voice commands
+├── model/                   # (You create this) The Vosk offline speech model
+├── .env                     # (You create this) Your secret API keys
+└── requirements.txt         # Python dependencies needed to run the app
+```
+
+### 🧰 Technology Used
 - **Frontend:** Python `Tkinter` (Minimalist Dark Mode).
 - **Backend:** Python 3.10+, `SpeechRecognition`, `Vosk`, and OpenRouter (`deepseek-r1:free`).
 - **Memory API:** `SQLite3` (Local Database).
