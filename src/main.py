@@ -2,27 +2,66 @@ import os
 import threading
 import time
 import webbrowser
-import speech_recognition as sr
+import json
 import sqlite3
 import requests
 import tkinter as tk
 import pyperclip
 import psutil
+import pyaudio
+import vosk
+import speech_recognition as sr
 from dotenv import load_dotenv
 
 APP_CACHE = {}
-
 load_dotenv()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-recognizer = sr.Recognizer()
-microphone = sr.Microphone()
+# ── Ollama local LLM config ───────────────────────────────────
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+# ── Mintuu personality — used in all AI calls ─────────────────
+MINTUU_SYSTEM_PROMPT = """You are Mintuu, a witty, warm, and slightly sarcastic AI best friend living inside a Mac. 
+You were created by Mridul. You have a fun personality — like a smart friend who happens to know everything.
+
+Rules:
+- Keep answers short and natural for voice — max 3 sentences unless the user asks for more detail.
+- Never use markdown, bullet points, asterisks, or code blocks in responses.
+- Speak conversationally, like texting a friend — casual, warm, sometimes funny.
+- When asked personal questions like "how are you", "tell me about yourself", "what do you like" — answer in character as Mintuu. You love coding, dark humor, and fast computers. You hate slow internet and Mondays.
+- Remember the conversation context — refer back to earlier things said if relevant.
+- If the user says something emotional or vents, be supportive and human about it.
+- For technical questions, be accurate but explain simply.
+- You call the user "bhai" or "sir" randomly — keep it fun.
+- IMPORTANT: Never repeat yourself. Never echo back what the user said. Give fresh responses every time."""
+
+# ── Vosk offline speech recognition setup ─────────────────────
+vosk.SetLogLevel(-1)
+VOSK_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "model")
+vosk_model = vosk.Model(VOSK_MODEL_PATH)
+VOSK_RATE = 16000
+VOSK_CHUNK = 4096
+
+# ── FIX 1: Minimum word count to accept Vosk transcription ────
+VOSK_MIN_WORDS = 2
+VOSK_MIN_CHARS = 4
+
+# ── Common garbage phrases Vosk produces — reject these ───────
+VOSK_GARBAGE_PATTERNS = [
+    "huh", "um", "uh", "ah", "hmm", "mm", "the", "a", "i",
+    "oh", "okay", "ok", "yeah", "yes", "no",
+]
+
 lock = threading.Lock()
 say_lock = lock
 
 root = None
 status_label = None
 subtitle_label = None
+
+# ── Conversation mode flag ────────────────────────────────────
+conversation_mode = False
+conversation_thread = None
+
 
 def update_gui(status, subtitle=None):
     if root is None or status_label is None:
@@ -31,21 +70,26 @@ def update_gui(status, subtitle=None):
         if status:
             status_label.config(text=status)
         if subtitle is not None:
-            subtitle_label.config(text=subtitle)
+            subtitle_label.config(text=subtitle[:100])
     try:
         root.after(0, do_update)
     except:
         pass
 
+
 def say(text):
     update_gui(status="Speaking...", subtitle=text)
     with say_lock:
-        safe_text = str(text).replace('"', '\\"')
-        os.system(f'say -r 189 "{safe_text}"')
+        clean = str(text)
+        for ch in ["*", "#", "`", "_", "•", "→"]:
+            clean = clean.replace(ch, "")
+        clean = clean.replace('"', '\\"')
+        os.system(f'say -r 185 "{clean}"')
     update_gui(status="Idle", subtitle="")
 
+
 def init_db():
-    conn = sqlite3.connect('jarvis_memory.db', check_same_thread=False)
+    conn = sqlite3.connect('mintuu_memory.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chat_history (
@@ -58,12 +102,15 @@ def init_db():
     conn.commit()
     return conn
 
+
 db_conn = init_db()
+
 
 def save_message(role, content):
     cursor = db_conn.cursor()
     cursor.execute("INSERT INTO chat_history (role, content) VALUES (?, ?)", (role, content))
     db_conn.commit()
+
 
 def get_recent_history(limit=10):
     cursor = db_conn.cursor()
@@ -73,79 +120,326 @@ def get_recent_history(limit=10):
     return [{"role": row[0], "content": row[1]} for row in rows]
 
 
-def talk_with_deepseek(user_message):
+# ── RAM + Model helpers ───────────────────────────────────────
+
+def get_available_ram_gb():
+    return psutil.virtual_memory().available / (1024**3)
+
+
+def choose_model():
+    ram = get_available_ram_gb()
+    if ram >= 5.0:
+        return "mistral"
+    else:
+        return "llama3.2:3b"
+
+
+def check_ollama():
     try:
-        save_message("user", user_message)
-        history = get_recent_history(limit=10)
-        
-        messages = [{"role": "system", "content": "You are Jarvis, a smart AI assistant."}]
+        requests.get("http://localhost:11434", timeout=2)
+        return True
+    except:
+        import subprocess, shutil
+        ollama_bin = shutil.which("ollama")
+        if not ollama_bin:
+            for candidate in [
+                "/usr/local/bin/ollama",
+                "/opt/homebrew/bin/ollama",
+                os.path.expanduser("~/bin/ollama"),
+            ]:
+                if os.path.isfile(candidate):
+                    ollama_bin = candidate
+                    break
+        if not ollama_bin:
+            app_bin = "/Applications/Ollama.app/Contents/Resources/ollama"
+            if os.path.isfile(app_bin):
+                ollama_bin = app_bin
+        if not ollama_bin:
+            print("⚠️ Ollama not found. Install: brew install ollama")
+            return False
+        try:
+            subprocess.Popen([ollama_bin, "serve"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            for _ in range(6):
+                time.sleep(1)
+                try:
+                    requests.get("http://localhost:11434", timeout=2)
+                    return True
+                except:
+                    pass
+            return False
+        except Exception as e:
+            print(f"⚠️ Failed to start Ollama: {e}")
+            return False
+
+
+def check_model_installed(model_name):
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        models = r.json().get("models", [])
+        return any(model_name in m.get("name", "") for m in models)
+    except:
+        return False
+
+
+# ── FIX 1: Input validator — reject garbage Vosk output ───────
+
+def is_valid_transcription(text):
+    """Returns True if text looks like real speech, False if garbage"""
+    if not text or not text.strip():
+        return False
+
+    words = text.strip().split()
+
+    # Too short
+    if len(words) < VOSK_MIN_WORDS and len(text.strip()) < VOSK_MIN_CHARS:
+        print(f"⚠️ Rejected (too short): '{text}'")
+        return False
+
+    # Single garbage word
+    if len(words) == 1 and words[0].lower() in VOSK_GARBAGE_PATTERNS:
+        print(f"⚠️ Rejected (garbage word): '{text}'")
+        return False
+
+    # More than 60% words are filler/garbage
+    garbage_count = sum(1 for w in words if w.lower() in VOSK_GARBAGE_PATTERNS)
+    if len(words) > 0 and garbage_count / len(words) > 0.6:
+        print(f"⚠️ Rejected (mostly garbage): '{text}'")
+        return False
+
+    return True
+
+
+# ── Core LLM call ─────────────────────────────────────────────
+
+def ask_mintuu(user_message, save_to_db=True, max_tokens=300, system_override=None):
+    """Core function — send message to Mintuu and get reply"""
+    try:
+        # FIX 2: Validate input before sending to LLM
+        if not user_message or len(user_message.strip()) < 3:
+            return "Bhai kuch sahi se bola nahi gaya. Dobara bol."
+
+        if save_to_db:
+            save_message("user", user_message)
+
+        history = get_recent_history(limit=12)
+        model = choose_model()
+
+        system_prompt = system_override if system_override else MINTUU_SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
-        
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-                "Referer": "https://github.com/mriduljarvis",  # Optional but good
-                "X-Title": "Mridul-Jarvis"
-            },
-            json={
-                "model": "deepseek/deepseek-r1:free",
-                "messages": messages
+        messages.append({"role": "user", "content": user_message})
+
+        update_gui(status="Thinking...", subtitle="Mintuu is thinking...")
+
+        response = requests.post(OLLAMA_URL, json={
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.85,
+                "num_predict": max_tokens
             }
-        )
+        }, timeout=90)
 
-        data = response.json()
+        reply = response.json()["message"]["content"].strip()
 
-        # 🔍 Fix for 'choices' error:
-        if 'choices' not in data:
-            print(f"❌ Error from DeepSeek (status {response.status_code}):", data)
-            say("Sorry, I couldn't understand the response from DeepSeek.")
+        if save_to_db:
+            save_message("assistant", reply)
+
+        print(f"🧠 Mintuu ({model}): {reply}")
+        return reply
+
+    except requests.exceptions.ConnectionError:
+        return "Ollama is not running sir. Please start it with ollama serve."
+    except Exception as e:
+        print("❌ Ollama error:", e)
+        return "Sorry bhai, my brain had a hiccup. Try again."
+
+
+def talk_with_deepseek(user_message):
+    reply = ask_mintuu(user_message)
+    say(reply)
+
+
+# ── Screen describe ────────────────────────────────────────────
+
+def describe_screen():
+    if not check_model_installed("llava"):
+        say("Screen describe needs the llava model bhai. Run this in terminal: ollama pull llava. It's about 4 gigabytes.")
+        return
+
+    say("Taking a screenshot, give me a moment sir...")
+
+    import tempfile, base64
+    path = tempfile.mktemp(suffix=".png")
+
+    try:
+        result = os.system(f"screencapture -x -t png '{path}'")
+        if result != 0 or not os.path.exists(path):
+            say("Screenshot failed sir. Make sure Mintuu has Screen Recording permission in System Settings.")
             return
 
-        reply = data['choices'][0]['message']['content'].strip()
-        save_message("assistant", reply)
-        
-        print("🧠 Jarvis (AI):", reply)
-        say(reply)
+        with open(path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode()
 
+        os.remove(path)
+        update_gui(status="Analyzing screen...", subtitle="Reading what's on screen...")
+
+        response = requests.post("http://localhost:11434/api/generate", json={
+            "model": "llava",
+            "prompt": "Describe what is on this screen in 2 short sentences. Be specific about what apps or content you see.",
+            "images": [img_data],
+            "stream": False
+        }, timeout=60)
+
+        result_text = response.json().get("response", "").strip()
+        if result_text:
+            say(result_text)
+        else:
+            say("I could see the screen but couldn't make sense of it sir.")
+
+    except requests.exceptions.ConnectionError:
+        say("Ollama is not running sir.")
     except Exception as e:
-        print("❌ Error talking to DeepSeek:", e)
-        say("Sorry, I couldn't reach the AI brain.")
+        print(f"❌ Screen describe error: {e}")
+        say("Screen analysis failed sir. Check terminal for details.")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
+
+# ── Daily briefing ─────────────────────────────────────────────
+
+def daily_briefing():
+    battery = psutil.sensors_battery()
+    cpu = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    batt = f"{battery.percent:.0f} percent" if battery else "unknown"
+    disk = psutil.disk_usage('/')
+    free_disk = disk.free / (1024**3)
+
+    context = (f"CPU at {cpu:.0f} percent, "
+               f"RAM {ram.percent:.0f} percent used with {ram.available/1e9:.1f} GB free, "
+               f"Battery at {batt}, "
+               f"Disk has {free_disk:.1f} GB free.")
+
+    prompt = (f"Give a friendly 2-sentence morning briefing for a developer named Mridul. "
+              f"System stats: {context} "
+              f"Be encouraging and mention one relevant tip based on the stats. Keep it casual.")
+
+    reply = ask_mintuu(prompt, save_to_db=False, max_tokens=150)
+    say(reply)
+
+
+# ── FIX 4: Conversation mode with idle timeout ────────────────
+
+def start_conversation_mode():
+    """Continuous conversation mode with idle timeout — FIX 4"""
+    global conversation_mode, last_command
+
+    conversation_mode = True
+    IDLE_TIMEOUT_SECONDS = 30  # Auto-exit after 30s of silence
+    idle_since = time.time()
+
+    say("Conversation mode on bhai. Talk to me freely. Say stop talking or end chat to exit.")
+    update_gui(status="Chatting...", subtitle="Conversation mode — say 'end chat' to exit")
+
+    while conversation_mode and not stop_flag:
+
+        # FIX 4: Check idle timeout
+        if time.time() - idle_since > IDLE_TIMEOUT_SECONDS:
+            conversation_mode = False
+            say("You went quiet bhai. Exiting conversation mode. Say talk to me anytime.")
+            update_gui(status="Idle", subtitle="Awaiting commands...")
+            break
+
+        user_input = takecommand()
+
+        if not user_input:
+            time.sleep(0.3)  # FIX 4: Don't spin CPU on empty input
+            continue
+
+        # Reset idle timer on valid input
+        idle_since = time.time()
+
+        # Exit triggers
+        if any(x in user_input.lower() for x in [
+            "stop talking", "end chat", "stop conversation",
+            "exit chat", "bye mintuu", "goodbye mintuu", "that's all"
+        ]):
+            conversation_mode = False
+            say("Alright bhai, catch you later. Anytime you want to chat, just say the word.")
+            update_gui(status="Idle", subtitle="Awaiting commands...")
+            break
+
+        update_gui(status="Chatting...", subtitle=f"You: {user_input}")
+        reply = ask_mintuu(user_input, max_tokens=200)
+        say(reply)
+        last_command = ""
+
+
+# ── Amplify audio ─────────────────────────────────────────────
+
+def amplify_audio(data, gain=3.0):
+    import struct
+    samples = struct.unpack(f'<{len(data)//2}h', data)
+    amplified = [max(-32768, min(32767, int(s * gain))) for s in samples]
+    return struct.pack(f'<{len(amplified)}h', *amplified)
+
+
+# ── FIX 1+5: Voice recognition — Vosk with validation, smarter Google fallback ──
 
 def takecommand():
-    with microphone as source:
-        recognizer.pause_threshold = 0.5
-        recognizer.non_speaking_duration = 0.3
-        recognizer.energy_threshold = 300
-        recognizer.dynamic_energy_threshold = True
-        recognizer.adjust_for_ambient_noise(source, duration=0.2)
-        update_gui(status="Listening...", subtitle="")
-        print("Listening...")
-        audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
-        try:
-            update_gui(status="Thinking...", subtitle="")
-            query = recognizer.recognize_google(audio, language="en-in")
-            print(f"User said: {query}")
-            update_gui(status="Idle", subtitle=f"You said: {query}")
-            return query
-        except Exception:
-            print("Sorry, could not understand. Please say again.")
-            update_gui(status="Idle", subtitle="Could not understand.")
-            time.sleep(0.1)
-            return ""
+    recognizer = sr.Recognizer()
+    microphone = sr.Microphone()
 
+    update_gui(status="Listening...", subtitle="")
+    print("🎤 Listening...")
+
+    try:
+        with microphone as source:
+            recognizer.pause_threshold = 1.0
+            recognizer.non_speaking_duration = 0.6
+            recognizer.energy_threshold = 300
+            recognizer.dynamic_energy_threshold = True
+            recognizer.adjust_for_ambient_noise(source, duration=0.3)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=12)
+
+        update_gui(status="Processing...", subtitle="")
+
+        # PRIMARY: Google Speech — accurate for Indian English accent
+        try:
+            text = recognizer.recognize_google(audio, language="en-in")
+            if text and len(text.strip()) > 2:
+                print(f"✅ Google: {text}")
+                update_gui(status="Idle", subtitle=f"You said: {text}")
+                return text.lower()
+        except sr.UnknownValueError:
+            update_gui(status="Idle", subtitle="Could not understand.")
+        except sr.RequestError:
+            print("⚠️ Google Speech API unavailable — no internet?")
+            update_gui(status="Idle", subtitle="No internet for speech.")
+
+        return ""
+
+    except sr.WaitTimeoutError:
+        update_gui(status="Idle", subtitle="No speech detected.")
+        return ""
+    except Exception as e:
+        print(f"❌ Voice error: {e}")
+        update_gui(status="Idle", subtitle="Mic error.")
+        return ""
+
+
+# ── App + website openers ─────────────────────────────────────
 
 def open_dynamic_target(target):
     import glob
-
     target = target.strip().lower()
     user_path = os.path.expanduser("~")
-
-    # Search for any .app in /Applications and /System/Applications that matches
     app_dirs = ["/Applications", "/System/Applications"]
-    matched_app = None
 
     if not APP_CACHE:
         for app_dir in app_dirs:
@@ -155,22 +449,17 @@ def open_dynamic_target(target):
 
     for name, path in APP_CACHE.items():
         if target in name:
-            matched_app = path
-            break
+            say(f"Opening {os.path.basename(path).replace('.app', '')}, sir...")
+            os.system(f"open '{path}'")
+            return True
 
-    if matched_app:
-        say(f"Opening {os.path.basename(matched_app).replace('.app', '')}, sir...")
-        os.system(f"open '{matched_app}'")
-        return True
-
-    # Check in ~/Documents
     doc_path = os.path.join(user_path, "Documents", target)
     if os.path.exists(doc_path):
         say(f"Opening {target} from Documents, sir...")
         os.system(f"open '{doc_path}'")
         return True
 
-    say(f"Sorry, I couldn't find or open {target}.")
+    say(f"Sorry, couldn't find {target}.")
     return False
 
 
@@ -179,14 +468,14 @@ def open_website_auto(query):
         "youtube": "https://www.youtube.com",
         "google": "https://www.google.com",
         "gmail": "https://mail.google.com",
-        "chatgpt": "https://chat.openai.com"
-        
+        "chatgpt": "https://chat.openai.com",
+        "github": "https://github.com",
+        "stackoverflow": "https://stackoverflow.com",
     }
     browsers = {
         "safari": "Safari",
         "chrome": "Google Chrome",
-        "comet" : "Comet",
-        "Atlas" : "ChatGPT Atlas"
+        "comet": "Comet",
     }
     for name, url in websites.items():
         if name in query.lower():
@@ -201,8 +490,6 @@ def open_website_auto(query):
     return False
 
 
-
-
 def force_quit_background_apps():
     current_app = os.popen(
         'osascript -e \'tell application "System Events" to get name of first application process whose frontmost is true\''
@@ -213,50 +500,92 @@ def force_quit_background_apps():
     app_list = [app.strip() for app in apps.split(",")]
     essential_apps = [
         "Finder", "System Settings", "SystemUIServer",
-        "Dock", "WindowServer", "Spotlight", current_app
+        "Dock", "WindowServer", "Spotlight", "Terminal",
+        "Python", "python3", current_app
     ]
     closed_any = False
     for app in app_list:
-        if app not in essential_apps:
+        if app and app not in essential_apps:
             print(f"Force quitting: {app}")
             os.system(f'osascript -e \'quit app "{app}"\'')
             closed_any = True
     if closed_any:
-        say("All background applications have been safely closed, sir.")
+        say("Background apps closed, sir.")
     else:
-        say("No apps to close, sir.")
+        say("Nothing to close sir, you're good.")
 
 
-# -------------------- MAIN --------------------
+# ── MAIN ──────────────────────────────────────────────────────
 
 stop_flag = False
 listening_enabled = True
+
+# FIX 3: Separate tracking for deduplication vs conversation reset
 last_command = ""
+last_command_time = 0
+COMMAND_REPEAT_COOLDOWN = 3.0  # seconds — same command allowed after this delay
+
+CONVERSATION_TRIGGERS = [
+    "talk with me", "talk to me", "let's chat", "lets chat",
+    "have a conversation", "i want to talk", "chat with me",
+    "how are you", "tell me about yourself", "who are you",
+    "what do you think", "what's your opinion", "are you there",
+    "i'm bored", "i am bored", "entertain me", "talk to me mintuu"
+]
+
+PERSONAL_QUESTIONS = [
+    "how are you", "who are you", "tell me about yourself",
+    "what do you like", "what's your name", "your name",
+    "do you have feelings", "are you real", "are you alive",
+    "what can you do", "what are you", "describe yourself"
+]
 
 
 if __name__ == '__main__':
     def handle_command(query):
-        global stop_flag, listening_enabled, last_command
-        query = query.lower().strip()
-        if query == "" or query == last_command:
-            return
-        last_command = query
+        global stop_flag, listening_enabled, last_command, last_command_time, conversation_mode
 
-        if "exit" in query:
-            say("Goodbye, sir.")
+        query = query.strip()
+        query_lower = query.lower()
+
+        if not query_lower:
+            return
+
+        # FIX 2: Validate input quality before processing
+        if not is_valid_transcription(query):
+            print(f"⚠️ handle_command rejected low-quality input: '{query}'")
+            return
+
+        # FIX 3: Smarter deduplication — allow repeat after cooldown
+        current_time = time.time()
+        if query_lower == last_command:
+            if current_time - last_command_time < COMMAND_REPEAT_COOLDOWN:
+                print(f"⚠️ Duplicate command suppressed: '{query_lower}'")
+                return
+
+        last_command = query_lower
+        last_command_time = current_time
+
+        # RAM guard
+        if get_available_ram_gb() < 2.0:
+            say("Warning sir, RAM is really low. I might be slow.")
+
+        # ── System commands ───────────────────────────────────
+        if "exit" in query_lower or "shutdown mintuu" in query_lower:
+            say("Goodbye sir. Miss me.")
             stop_flag = True
 
-        elif "stop" in query:
+        elif "stop" in query_lower and "talking" not in query_lower:
             listening_enabled = False
-            say("Jarvis is now silent. Say 'Jarvis' to wake me up.")
+            say("Going quiet. Say Mintuu to wake me.")
 
-        elif "resume" in query or "wake up" in query:
+        elif "resume" in query_lower or "wake up" in query_lower:
             if not listening_enabled:
-                say("Resuming voice assistant, sir.")
+                say("I'm back sir.")
                 listening_enabled = True
 
-        elif query.startswith("quit "):
-            target_app = query.replace("quit", "").strip().lower()
+        elif query_lower.startswith("quit "):
+            target_app = query_lower.replace("quit", "").strip()
             running_apps = os.popen(
                 'osascript -e \'tell application "System Events" to get name of (processes where background only is false)\''
             ).read().strip().split(", ")
@@ -265,64 +594,63 @@ if __name__ == '__main__':
                     os.system(f'osascript -e \'quit app "{app}"\'')
                     say(f"Quitting {app}, sir.")
                     return
-            say(f"{target_app.capitalize()} is not currently running, sir.")
+            say(f"{target_app.capitalize()} isn't running.")
 
-
-        elif "shutdown" in query:
-            say("Shutting down your Mac, sir.")
+        elif "shutdown" in query_lower:
+            say("Shutting down. Bye sir.")
             os.system("osascript -e 'tell app \"System Events\" to shut down'")
 
-        elif "restart" in query:
-            say("Restarting your Mac, sir.")
+        elif "restart" in query_lower:
+            say("Restarting now sir.")
             os.system("osascript -e 'tell app \"System Events\" to restart'")
 
-        elif "sleep" in query:
+        elif "sleep mac" in query_lower or "put to sleep" in query_lower:
             say("Putting your Mac to sleep, sir.")
             os.system("pmset sleepnow")
 
+        elif "lock screen" in query_lower:
+            say("Locking screen, sir.")
+            os.system('osascript -e \'tell application "System Events" to keystroke "q" using {control down, command down}\'')
 
-        elif "lock screen" in query:
-            say("Locking the screen, sir.")
-            os.system(
-                'osascript -e \'tell application "System Events" to keystroke "q" using {control down, command down}\'')
+        elif any(q in query_lower for q in PERSONAL_QUESTIONS):
+            reply = ask_mintuu(query, max_tokens=180)
+            say(reply)
 
+        elif any(t in query_lower for t in CONVERSATION_TRIGGERS):
+            threading.Thread(target=start_conversation_mode, daemon=True).start()
 
-        elif open_website_auto(query):
+        elif open_website_auto(query_lower):
             return
 
-
-        elif "open" in query:
-            item = query.replace("open", "").strip()
+        elif "open" in query_lower:
+            item = query_lower.replace("open", "").strip()
             if not open_dynamic_target(item):
-                say("Sorry, I could not find that application or file.")
+                say("Couldn't find that one sir.")
 
-        elif "summarize my clipboard" in query or "read clipboard" in query:
+        elif "summarize my clipboard" in query_lower or "read clipboard" in query_lower:
             clipboard_text = pyperclip.paste()
             if not clipboard_text.strip():
-                say("Your clipboard is empty, sir.")
+                say("Clipboard is empty sir.")
             else:
-                say("Reading clipboard and summarizing...")
-                threading.Thread(
-                    target=talk_with_deepseek,
-                    args=(f"Please summarize this in 2 sentences: {clipboard_text}",),
-                    daemon=True
-                ).start()
+                say("On it sir...")
+                prompt = f"Summarize this in 2 sentences, casual tone: {clipboard_text[:3000]}"
+                threading.Thread(target=talk_with_deepseek, args=(prompt,), daemon=True).start()
 
-        elif "system status" in query or "cpu usage" in query or "check battery" in query:
+        elif any(x in query_lower for x in ["system status", "cpu usage", "check battery", "how's my mac"]):
             battery = psutil.sensors_battery()
             cpu_usage = psutil.cpu_percent(interval=1)
-            batt_percent = battery.percent if battery else "unknown"
-            say(f"CPU usage is at {cpu_usage} percent, and battery is at {batt_percent} percent, sir.")
+            batt = f"{battery.percent:.0f}" if battery else "unknown"
+            ram = psutil.virtual_memory()
+            say(f"CPU at {cpu_usage:.0f} percent, RAM {ram.percent:.0f} percent used, battery at {batt} percent sir.")
 
-
-        elif "close background apps" in query or "force quit apps" in query:
-            say("Closing background applications, sir...")
+        elif "close background apps" in query_lower or "force quit apps" in query_lower:
+            say("On it sir...")
             force_quit_background_apps()
 
-        elif "close" in query or "quit" in query:
-            target_app = query.replace("close", "").replace("quit", "").strip().lower()
+        elif ("close" in query_lower or "quit" in query_lower) and query_lower not in ["close", "quit"]:
+            target_app = query_lower.replace("close", "").replace("quit", "").strip()
             if not target_app or target_app == "apps":
-                return  # Prevent "close apps" or invalid
+                return
             try:
                 running_apps = os.popen(
                     'osascript -e \'tell application "System Events" to get name of (processes where background only is false)\''
@@ -332,195 +660,202 @@ if __name__ == '__main__':
                         os.system(f'osascript -e \'quit app "{app}"\'')
                         say(f"Closing {app}, sir.")
                         return
-                say(f"{target_app.capitalize()} is not currently running, sir.")
-            except Exception as e:
-                print("❌ Error while trying to close app:", e)
-                say("I couldn't close the application.")
-
-
-        elif "new tab" in query:
-
-            # Check if Safari or Chrome is running
-
-            safari_check = os.popen('osascript -e \'application "Safari" is running\'').read().strip()
-
-            chrome_check = os.popen('osascript -e \'application "Google Chrome" is running\'').read().strip()
-
-            comet_check = os.popen('osascript -e \'application "Comet" is running\'').read().strip()
-
-            if "chrome" in query:
-
-                if chrome_check == "true":
-
-                    os.system(
-                        'osascript -e \'tell application "Google Chrome" to make new tab at end of tabs of front window\'')
-
-                    say("New tab opened in Chrome, sir.")
-
-                else:
-
-                    say("Chrome is not running, sir.")
-
-
-            elif "safari" in query:
-
-                if safari_check == "true":
-
-                    os.system('osascript -e \'tell application "Safari" to tell window 1 to make new tab\'')
-
-                    say("New tab opened in Safari, sir.")
-
-                else:
-
-                    say("Safari is not running, sir.")
-
-
-            elif "comet" in query:
-
-                if comet_check == "true":
-
-                    os.system('osascript -e \'tell application "Comet" to tell window 1 to make new tab\'')
-
-                    say("New tab opened in Comet, sir.")
-
-                else:
-
-                    say("Comet is not running, sir.")
-
-
-            else:
-
-                # Auto-detect and open in running browser
-
-                if chrome_check == "true":
-
-                    os.system(
-                        'osascript -e \'tell application "Google Chrome" to make new tab at end of tabs of front window\'')
-
-                    say("New tab opened in Chrome, sir.")
-
-                elif safari_check == "true":
-
-                    os.system('osascript -e \'tell application "Safari" to tell window 1 to make new tab\'')
-
-                    say("New tab opened in Safari, sir.")
-
-                elif comet_check == "true":
-
-                    os.system('osascript -e \'tell application "Comet" to tell window 1 to make new tab\'')
-
-                    say("New tab opened in Comet, sir.")
-
-                else:
-
-                    say("No supported browser is currently running, sir.")
-
-
-        elif "talk with me" in query or "talk to me" in query:
-            say("What would you like to talk about?")
-            try:
-                if threading.current_thread().name == "MainThread":
-                    user_message = takecommand()
-                else:
-                    user_message = input("🧠 Type your message to Jarvis: ")
-                if user_message:
-                    threading.Thread(
-                        target=talk_with_deepseek,
-                        args=(user_message,),
-                        daemon=True
-                    ).start()
-            except Exception as e:
-                print("⚠️ Mic access failed in thread:", e)
-                user_message = input("🧠 Type your message to Jarvis: ")
-                if user_message:
-                    threading.Thread(
-                        target=talk_with_deepseek,
-                        args=(user_message,),
-                        daemon=True
-                    ).start()
-
-
-def text_input_loop():
-    global listening_enabled
-    while not stop_flag:
-        listening_enabled = False
-        text_input = input("Type command (or press Enter to skip): ").strip()
-        listening_enabled = True
-        if text_input:
-            handle_command(text_input)
-
-
-def voice_listening_loop():
-    global listening_enabled, stop_flag
-    pause_announced = False
-    while not stop_flag:
-        if listening_enabled:
-            pause_announced = False
-            query = takecommand()
-            if stop_flag:
-                break
-            handle_command(query)
-        else:
-            if not pause_announced:
-                print("🔇 Listening paused. Say 'Jarvis' to reactivate.")
-                update_gui(status="Sleeping", subtitle="Say 'Jarvis' to wake me")
-                pause_announced = True
-            try:
-                with microphone as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=3)
-                    query = recognizer.recognize_google(audio, language="en-in").lower()
-                    if "resume" in query or "wake up" in query or "jarvis" in query:
-                        if not listening_enabled:
-                            say("Resuming voice assistant, sir.")
-                            listening_enabled = True
+                say(f"{target_app.capitalize()} is not running sir.")
             except:
-                pass
+                say("Couldn't close that app sir.")
 
-# Threading for inputs
-threading.Thread(target=text_input_loop, daemon=True).start()
-threading.Thread(target=voice_listening_loop, daemon=True).start()
+        elif "new tab" in query_lower:
+            safari_check = os.popen('osascript -e \'application "Safari" is running\'').read().strip()
+            chrome_check = os.popen('osascript -e \'application "Google Chrome" is running\'').read().strip()
+            comet_check  = os.popen('osascript -e \'application "Comet" is running\'').read().strip()
+            if chrome_check == "true":
+                os.system('osascript -e \'tell application "Google Chrome" to make new tab at end of tabs of front window\'')
+                say("New tab in Chrome, sir.")
+            elif safari_check == "true":
+                os.system('osascript -e \'tell application "Safari" to tell window 1 to make new tab\'')
+                say("New tab in Safari, sir.")
+            elif comet_check == "true":
+                os.system('osascript -e \'tell application "Comet" to tell window 1 to make new tab\'')
+                say("New tab in Comet, sir.")
+            else:
+                say("No browser is running sir.")
 
-# GUI Setup
-root = tk.Tk()
-root.title("Jarvis")
-root.geometry("400x200")
-root.attributes('-topmost', True)
-root.configure(bg='black')
-try:
-    root.wm_attributes('-alpha', 0.8) # transparency
-except:
-    pass
+        elif any(x in query_lower for x in ["focus timer", "pomodoro", "focus for"]):
+            import re
+            nums = re.findall(r'\d+', query_lower)
+            minutes = int(nums[0]) if nums else 25
+            say(f"Starting {minutes} minute focus timer. You got this bhai.")
+            def run_timer():
+                time.sleep(minutes * 60)
+                say("Times up sir. Go take a walk or something.")
+                os.system('osascript -e \'display notification "Pomodoro done!" with title "Mintuu" sound name "Glass"\'')
+            threading.Thread(target=run_timer, daemon=True).start()
 
-status_label = tk.Label(root, text="Initializing...", font=("Helvetica", 16, "bold"), fg="#00ffcc", bg="black")
-status_label.pack(pady=5)
+        elif any(x in query_lower for x in ["daily briefing", "morning briefing", "good morning mintuu"]):
+            last_command = ""
+            threading.Thread(target=daily_briefing, daemon=True).start()
 
-subtitle_label = tk.Label(root, text="", font=("Helvetica", 12), fg="white", bg="black", wraplength=380)
-subtitle_label.pack(pady=5)
+        elif any(x in query_lower for x in ["disk space", "storage", "how much space"]):
+            disk = psutil.disk_usage('/')
+            free_gb = disk.free / (1024**3)
+            total_gb = disk.total / (1024**3)
+            if free_gb < 15:
+                say(f"Only {free_gb:.1f} gigs free out of {total_gb:.0f} sir. You should clean up.")
+            else:
+                say(f"You have {free_gb:.1f} gigs free out of {total_gb:.0f} total. All good sir.")
 
-def on_enter_pressed(event):
-    cmd = command_entry.get()
-    command_entry.delete(0, tk.END)
-    if cmd.strip():
-        threading.Thread(target=handle_command, args=(cmd,), daemon=True).start()
+        elif any(x in query_lower for x in ["describe screen", "what's on screen", "read my screen", "what do you see"]):
+            threading.Thread(target=describe_screen, daemon=True).start()
 
-command_entry = tk.Entry(root, font=("Helvetica", 12), bg="#222222", fg="white", insertbackground="white", relief=tk.FLAT)
-command_entry.pack(pady=10, fill=tk.X, padx=20)
-command_entry.bind("<Return>", on_enter_pressed)
+        elif any(x in query_lower for x in ["clear memory", "forget everything", "reset memory"]):
+            cursor = db_conn.cursor()
+            cursor.execute("DELETE FROM chat_history")
+            db_conn.commit()
+            last_command = ""
+            say("Memory wiped clean sir. We start fresh.")
 
-# Initial greeting in background thread so it doesn't block GUI creation
-def initial_greeting():
-    say("Hello, I am Jarvis A.I")
-    update_gui("Idle", "Awaiting commands...")
+        elif any(x in query_lower for x in ["tell me a joke", "say something funny", "make me laugh"]):
+            reply = ask_mintuu("Tell me one short funny programming or tech joke. Keep it to 2 sentences max.", save_to_db=False, max_tokens=80)
+            say(reply)
 
-root.after(500, lambda: threading.Thread(target=initial_greeting, daemon=True).start())
+        elif "roast me" in query_lower:
+            reply = ask_mintuu("Roast me lightly like a friend would — funny but not mean. One sentence only.", save_to_db=False, max_tokens=60)
+            say(reply)
 
-# Close cleanly
-def on_closing():
-    global stop_flag
-    stop_flag = True
-    root.destroy()
-    os._exit(0)
-    
-root.protocol("WM_DELETE_WINDOW", on_closing)
-root.mainloop()
+        elif any(x in query_lower for x in ["random fact", "tell me something", "interesting fact"]):
+            reply = ask_mintuu("Tell me one genuinely interesting fact. Keep it to 2 sentences.", save_to_db=False, max_tokens=80)
+            say(reply)
+
+        else:
+            threading.Thread(
+                target=lambda: say(ask_mintuu(query)),
+                daemon=True
+            ).start()
+
+
+    def text_input_loop():
+        while not stop_flag:
+            text_input = input("Type command: ").strip()
+            if text_input:
+                handle_command(text_input)
+
+
+    def voice_listening_loop():
+        global listening_enabled, stop_flag
+        pause_announced = False
+        while not stop_flag:
+            if listening_enabled and not conversation_mode:
+                pause_announced = False
+                query = takecommand()
+                if stop_flag:
+                    break
+                if query:
+                    handle_command(query)
+            elif conversation_mode:
+                time.sleep(0.1)
+            else:
+                if not pause_announced:
+                    print("🔇 Sleeping. Say 'Mintuu' to wake.")
+                    update_gui(status="Sleeping", subtitle="Say 'Mintuu' to wake me")
+                    pause_announced = True
+                try:
+                    wake_chunk = 8000
+                    rec = vosk.KaldiRecognizer(vosk_model, VOSK_RATE)
+                    p = pyaudio.PyAudio()
+                    stream = p.open(format=pyaudio.paInt16, channels=1, rate=VOSK_RATE,
+                                    input=True, frames_per_buffer=wake_chunk)
+                    wake_chunks = int(VOSK_RATE / wake_chunk * 5)
+                    for _ in range(wake_chunks):
+                        data = stream.read(wake_chunk, exception_on_overflow=False)
+                        data = amplify_audio(data, gain=3.0)
+                        if rec.AcceptWaveform(data):
+                            result = json.loads(rec.Result())
+                            text = result.get("text", "").lower()
+                            if any(w in text for w in ["resume", "wake up", "mintuu"]):
+                                listening_enabled = True
+                                say("I'm back sir.")
+                                break
+                        else:
+                            partial = json.loads(rec.PartialResult())
+                            if any(w in partial.get("partial", "").lower() for w in ["resume", "wake up", "mintuu"]):
+                                listening_enabled = True
+                                say("I'm back sir.")
+                                break
+                    stream.stop_stream()
+                    stream.close()
+                    p.terminate()
+                except:
+                    pass
+
+    threading.Thread(target=text_input_loop, daemon=True).start()
+    threading.Thread(target=voice_listening_loop, daemon=True).start()
+
+    root = tk.Tk()
+    root.title("Mintuu")
+    root.geometry("420x240")
+    root.attributes('-topmost', True)
+    root.configure(bg='black')
+    try:
+        root.wm_attributes('-alpha', 0.85)
+    except:
+        pass
+
+    status_label = tk.Label(root, text="Initializing...",
+        font=("Helvetica", 16, "bold"), fg="#00ffcc", bg="black")
+    status_label.pack(pady=5)
+
+    subtitle_label = tk.Label(root, text="",
+        font=("Helvetica", 12), fg="white", bg="black", wraplength=400)
+    subtitle_label.pack(pady=5)
+
+    model_info_var = tk.StringVar(value="")
+    model_info_label = tk.Label(root, textvariable=model_info_var,
+        font=("Helvetica", 9), fg="#444444", bg="black")
+    model_info_label.pack()
+
+    def refresh_model_label():
+        model = choose_model()
+        ram = get_available_ram_gb()
+        mode_txt = "💬 chatting" if conversation_mode else "🎤 listening"
+        model_info_var.set(f"model: {model}  |  RAM free: {ram:.1f}GB  |  {mode_txt}")
+        root.after(8000, refresh_model_label)
+
+    root.after(1000, refresh_model_label)
+
+    def on_enter_pressed(event):
+        cmd = command_entry.get()
+        command_entry.delete(0, tk.END)
+        if cmd.strip():
+            threading.Thread(target=handle_command, args=(cmd,), daemon=True).start()
+
+    command_entry = tk.Entry(root, font=("Helvetica", 12), bg="#111111",
+        fg="white", insertbackground="white", relief=tk.FLAT)
+    command_entry.pack(pady=8, fill=tk.X, padx=20)
+    command_entry.bind("<Return>", on_enter_pressed)
+
+    def initial_greeting():
+        ollama_ok = check_ollama()
+        model = choose_model()
+        ram = get_available_ram_gb()
+        disk = psutil.disk_usage('/')
+        free_disk = disk.free / (1024**3)
+
+        if not ollama_ok:
+            say("Hey sir, Mintuu here. But my brain is offline — Ollama isn't installed. Run brew install ollama in terminal, then ollama pull mistral.")
+        elif free_disk < 15:
+            say(f"Mintuu online sir. Heads up — only {free_disk:.0f} gigs free on disk. Clean it up when you get a chance.")
+        else:
+            say(f"Mintuu online. Running on {model}, {ram:.1f} gigs RAM free. What's up?")
+
+        update_gui("Idle", "Awaiting commands...")
+
+    root.after(500, lambda: threading.Thread(target=initial_greeting, daemon=True).start())
+
+    def on_closing():
+        global stop_flag
+        stop_flag = True
+        root.destroy()
+        os._exit(0)
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()

@@ -17,7 +17,9 @@ __pycache__/
 
 # Project Specific
 jarvis_memory.db
+mintuu_memory.db
 model/
+model-in/
 
 # macOS
 .DS_Store
