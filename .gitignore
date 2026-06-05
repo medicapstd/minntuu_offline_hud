@@ -23,3 +23,8 @@ model-in/
 
 # macOS
 .DS_Store
+
+node_modules/
+*.db
+chroma_db/
+.tmp_venv/
